@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE RootStep>
+<RootStep id="_0" name="root" version="5.2.1">
+  <include>qfs.qft</include>
+  <TestSet id="_1" name="unnamed">
+    <TestCase id="_2" name="unnamed"/>
+  </TestSet>
+  <PackageRoot id="_3">
+    <Procedure id="_QHbZX" name="imagecheck">
+      <variable name="screen"/>
+      <comment>Implementation of SUT screen comparison against saved image template.
+Images are compared pixel-by-pixel.
+It is possible to define image subregions that are ignored during the comparison.
+In case some differences are found, error is logged in the runlog together with graphical comparison of both images.
+
+Note: In case given fileName does not exist, SUT screenshot is saved into that path.
+
+@param	screen	Keyword for given screen
+
+@author	Uelel
+@since	10.08.2021</comment>
+      <ClientScriptStep client="$(client)" id="_QHbZY"
+                        name="Define custom RGB array">
+        <code>from time import time
+from java.awt import Color
+from java.awt.image import BufferedImage
+from de.qfs.apps.qftest.shared.extensions.image import ImageRep
+
+global RGBArray
+class RGBArray:
+    """
+    Custom implementation of array holding RGB data of image
+    Basic init/get/set operations defined
+    """
+    
+    def __init__(self,img):
+        """
+        Load given image buffer into flattened array
+        @param{BufferedImage/ImageRep} img - input image
+        """
+        startTime = time()
+        
+        if type(img) == BufferedImage:
+            self.width = img.getWidth()
+            self.height = img.getHeight()
+            self.data = img.getRGB(0,0,
+                                   self.width,
+                                   self.height,
+                                   None,0,
+                                   self.width)
+                                   
+        elif type(img) == ImageRep:
+            self.width = img.getWidth()
+            self.height = img.getHeight()
+            self.data = img.getARGB()
+            
+        self.loadingTime = time() - startTime
+       
+    def Iter(self,ax,val):
+        """
+        Generator yielding partial indices for flattened 1D array
+        corresponding to given indices of given axis in 2D array
+        Note: Formulas for conversion of indices between 1D and 2D arrays:
+              i = x + y*width
+              x = i % width
+              y = (i-x)/width
+        @param{int} ax - axis; x=0, y=1
+        @param{slice/int} val - indices in given axis
+        @return{int} subindex; resulting index i = subindex(x)+subindex(y)
+        """
+        if type(val) == slice:
+            if val.start == None: start = 0
+            else: start = val.start
+            if val.stop == None:
+                if ax == 0: stop = self.width
+                elif ax == 1: stop = self.height
+            else: stop = val.stop
+            for i in range(start,stop):
+                if ax == 0:
+                    if i &lt; 0 or i &gt; self.width:
+                        raise Exception("x dimension "+str(i)+
+                                        " out of range for width "+str(self.width))
+                    yield i
+                if ax == 1:
+                    if i &lt; 0 or i &gt; self.height:
+                        raise Exception("y dimension "+str(i)+
+                                        " out of range for height "+str(self.height))
+                    yield i*self.width
+        else:
+            if ax == 0:
+                if val &lt; 0 or val &gt; self.width:
+                    raise Exception("x dimension "+str(val)+
+                                    " out of range for width "+str(self.width))
+                yield val
+            if ax == 1:
+                if val &lt; 0 or val &gt; self.height:
+                    raise Exception("y dimension "+str(val)+
+                                    " out of range for height "+str(self.height))
+                yield val*self.width
+    
+    def __getitem__(self, keys):
+        """
+        Get items from array
+        @param{int/tuple} keys - can refer to both 1D/2D indices
+        """
+        if type(keys) == tuple:
+            x,y = keys
+            lst = list()
+            for i in self.Iter(0,x):
+                for j in self.Iter(1,y):
+                    lst.append(self.data[i+j])
+            return lst
+        elif type(keys) == int:
+            i = keys
+            return self.data[i]   
+            
+    def __setitem__(self, keys, val):
+        """
+        Set array items
+        @param{int/tuple} keys - can refer to both 1D/2D indices
+        @param{int} val - setter value 
+        """
+        if type(keys) == tuple:
+            x,y = keys
+            for i in self.Iter(0,x):
+                for j in self.Iter(1,y):
+                    self.data[i+j] = val
+        elif type(keys) == int:
+            i = keys
+            self.data[i] = val
+
+    @property
+    def length(self):
+        """
+        Get length of flattened 1D array
+        """
+        return len(self.data)
+
+    @property
+    def shape(self):
+        """
+        Get shape of original 2D array
+        """
+        return self.width, self.height</code>
+      </ClientScriptStep>
+      <ClientScriptStep client="$(client)" id="_QHbZZ"
+                        name="Define custom Image comparator">
+        <code>from java.io import File
+from java.util import Arrays
+from imagewrapper import ImageWrapper
+from java.awt.image import BufferedImage
+from javax.imageio import ImageIO, IIOException
+from de.qfs.apps.qftest.shared.extensions.image import ImageRep
+from de.qfs.apps.qftest.shared.exceptions import UnresolvedComponentIdException
+
+global ImageComparator
+class ImageComparator:
+    """
+    Compares pixel-by-pixel of two images with same resolution
+    Ignores defined subregions during comparison
+    """
+    
+    def LoadFile(self, fileName):
+        """
+        Load image with given fileName into image buffer
+        Use javax.imageio.ImageIO class
+        Note: iw.loadPng does not handle exceptions properly
+        Save actual screen into given fileName in case it does not exist
+        @param{str} fileName
+        @retun{BufferedImage}
+        """
+        f = File(fileName)
+        try:
+            img = ImageIO.read(f)
+            if type(img) != BufferedImage:
+                raise Exception("ImageComparator: Could not load "
+                                "image from file: "+fileName)
+            return img
+        except IIOException:
+            self.iw.savePng(fileName, self.act_buf)
+            return self.act_buf
+
+    def GetScreen(self,ID):
+        """
+        Get screenshot of SUT component with given ID
+        Use QF-Test ImageWrapper object
+        @param{str} ID - QF-Test ID of given component
+        @return{ImageRep}
+        """
+        try:
+            img = self.iw.grabImage(rc.getComponent(ID))
+            if type(img) != ImageRep:
+                raise Exception("ImageComparator: Getting screenshot of SUT: "
+                                "unknown type '"+type(img)+"' "
+                                "of resulting object")
+            return img
+        except UnresolvedComponentIdException:
+            raise Exception("ImageComparator: Getting screenshot of SUT: "
+                            "unknown component "+ID)
+
+    def HiddenRegion(self,x1=None,x2=None,y1=None,y2=None):
+        """
+        Register hidden region into the instance
+        @param{int} x1,x2,y1,y2 - pixel boundaries of given region 
+        """
+        self.HiddenRegions.append([x1,x2,y1,y2])
+
+    def ArraysAreEqual(self):
+        """
+        Compare RGB arrays of actual and expected images
+        Use java.util.Arrays
+        @return{bool} True in case arrays are equal, False otherwise
+        """
+        if self.act_arr.shape != self.exp_arr.shape:
+            raise Exception("ImageComparator: shape of expected image "+
+                            str(self.exp_arr.shape)+
+                            " is not equal to shape of actual screen "+
+                            str(self.act_arr.shape))
+    
+        if Arrays.deepEquals(self.act_arr.data, self.exp_arr.data):
+            return True
+        else:
+            return False
+    
+    def GetArrayDiff(self):
+        from java.util import HashSet
+        hash_act = HashSet(Arrays.asList(self.act_arr.data))
+        hash_act2 = HashSet(Arrays.asList(self.act_arr.data))
+        print hash_act.size()
+        
+        hash_exp = HashSet(Arrays.asList(self.exp_arr.data))
+        hash_exp2 = HashSet(Arrays.asList(self.exp_arr.data))
+        print hash_exp.size()
+        
+        diff1 = hash_act.removeAll(hash_exp)
+        print hash_act.size()
+        
+        diff2 = hash_exp2.removeAll(hash_act2)
+        print hash_exp2.size()
+
+    def LogError(self):
+        """
+        Calls rc.checkImage for actual and expected images
+        In case images differ, the error is logged together
+        with graphical comparison of both images into runlog
+        """
+        exp = self.iw.loadPng(self.FileName)
+        rc.checkImage(self.act_buf,
+                      exp,
+                      "ImageComparator: Some differences were found!",
+                      rc.ERROR,
+                      1)
+    
+    def Run(self):
+        # Load actual image
+        self.act_buf = self.GetScreen(self.CompID)
+        self.act_arr = RGBArray(self.act_buf)
+        
+        # Load expected image
+        self.exp_buf = self.LoadFile(self.FileName)
+        self.exp_arr = RGBArray(self.exp_buf)
+        
+        # Hide regions
+        for reg in self.HiddenRegions:
+            x1,x2,y1,y2 = reg
+            if x1&lt;0: x1=0
+            if x2&gt;self.act_arr.shape[0]: x2=self.act_arr.shape[0]
+            if y1&lt;0: y1=0
+            if y2&gt;self.act_arr.shape[1]: y2=self.act_arr.shape[1]
+            self.exp_arr[x1:x2,y1:y2] = 0
+            self.act_arr[x1:x2,y1:y2] = 0
+        
+        # Compare images
+        if self.ArraysAreEqual():
+            rc.logMessage("ImageComparator: no differences were found")
+        else:
+            self.LogError()
+            
+    def __init__(self):
+        self.iw = ImageWrapper(rc)
+        self.FileName = None
+        self.CompID = None
+        self.HiddenRegions = list()</code>
+      </ClientScriptStep>
+      <ClientScriptStep client="$(client)" id="_QHbZa"
+                        name="Implement image comparator for each keyword">
+        <code>screen = rc.lookup("screen")
+
+ic = ImageComparator()
+
+if screen == "registration":
+    ic.CompID = "screen1"
+    ic.FileName = "C:/screens/registration.png"
+    # Hide datetime &amp; mode on top panel
+    ic.HiddenRegion(x1=340,x2=510,y1=0,y2=55)
+    
+elif screen == "login":
+    ic.CompID = "screen1"
+    ic.FileName = "C:/screens/login.png"
+    # Hide datetime &amp; mode on top panel
+    ic.HiddenRegion(x1=340,x2=510,y1=0,y2=55)
+    # Hide bottom panel with hardware info
+    ic.HiddenRegion(x1=10,x2=1015,y1=715,y2=768)
+    
+elif screen == "break":
+    ic.CompID = "screen1"
+    ic.FileName = "C:/screens/break.png"
+    # Hide datetime &amp; mode on top panel
+    ic.HiddenRegion(x1=340,x2=510,y1=0,y2=55)
+    
+elif screen == "logout":
+    ic.CompID = "screen1"
+    ic.FileName = "C:/screens/logout.png"
+    # Hide datetime &amp; mode on top panel
+    ic.HiddenRegion(x1=340,x2=510,y1=0,y2=55)
+    
+elif screen == "payment":
+    ic.CompID = "screen1"
+    ic.FileName = "C:/screens/payment.png"
+    # Hide datetime &amp; mode on top panel
+    ic.HiddenRegion(x1=340,x2=510,y1=0,y2=55)
+    # Hide item in bon preview
+    ic.HiddenRegion(x1=10,x2=510,y1=70,y2=460)
+    # Hide title with bon sum
+    ic.HiddenRegion(x1=750,x2=1030,y1=0,y2=55)
+
+ic.Run()</code>
+      </ClientScriptStep>
+    </Procedure>
+  </PackageRoot>
+  <ExtraSequence id="_4"/>
+  <WindowList id="_5"/>
+</RootStep>
